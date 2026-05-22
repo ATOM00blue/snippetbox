@@ -152,6 +152,23 @@ or for scripting/testing:
 SNIPPETBOX_STORE=./project-snippets.json snippetbox add -t "Deploy" -c "make deploy"
 ```
 
+### Security notes
+
+- **Permissions.** Because snippets often contain secrets, the store file is
+  written `0600` (owner read/write only) and its directory `0700`, using an
+  atomic temp-file + rename. `export -o FILE` is likewise written `0600`. (On
+  Windows, Go maps these onto the platform's ACL model.)
+- **Terminal-safe rendering.** Snippet content can come from anywhere (imports,
+  pasted text). snippetbox strips terminal escape/control sequences from any
+  content it renders to your terminal — in the TUI preview and list, and in the
+  `show` / `list` / `find` output — so a hostile snippet can't hijack your
+  terminal. Legitimate newlines and tabs are preserved. The `--json` outputs and
+  `export` emit data, not terminal output, and are JSON-escaped.
+- **Import limits.** `import` rejects files over 16 MiB, validates every snippet,
+  and skips entries with no title or content.
+- **No code execution.** snippetbox never executes snippet content. `show` simply
+  prints it; piping it into a shell (`snippetbox show foo | bash`) is your choice.
+
 ## FAQ
 
 **Is this the "Let's Go" / Alex Edwards tutorial web app?**
