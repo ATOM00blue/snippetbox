@@ -1,0 +1,25 @@
+# Binaries
+/snippetbox
+/snippetbox.exe
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Local scratch / temp stores
+.tmpstore/
+*.tmp
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Go workspace
+go.work
+go.work.sum
