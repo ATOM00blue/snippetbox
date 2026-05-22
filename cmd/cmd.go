@@ -11,12 +11,17 @@ import (
 	"os"
 	"strings"
 
+	"github.com/ATOM00blue/snippetbox/internal/sanitize"
 	"github.com/ATOM00blue/snippetbox/internal/search"
 	"github.com/ATOM00blue/snippetbox/internal/snippet"
 	"github.com/ATOM00blue/snippetbox/internal/store"
 	"github.com/ATOM00blue/snippetbox/internal/tui"
 	"github.com/atotto/clipboard"
 )
+
+// maxImportBytes caps the size of an import file to bound memory use from a
+// hostile or accidentally huge file.
+const maxImportBytes = 16 << 20 // 16 MiB
 
 // Version is the build version, overridable at link time:
 //
@@ -187,7 +192,7 @@ func cmdFind(storePath string, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, r := range results {
-		fmt.Fprintf(stdout, "%s\t%s\n", r.Snippet.ID, r.Snippet.Summary())
+		fmt.Fprintf(stdout, "%s\t%s\n", r.Snippet.ID, sanitize.Line(r.Snippet.Summary()))
 	}
 	return 0
 }
@@ -230,7 +235,8 @@ func cmdShow(storePath string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "snippetbox: no snippet matching %q\n", query)
 		return 1
 	}
-	fmt.Fprintln(stdout, sn.Content)
+	// Strip terminal control sequences before printing untrusted content.
+	fmt.Fprintln(stdout, sanitize.Content(sn.Content))
 	return 0
 }
 
@@ -256,7 +262,7 @@ func cmdList(storePath string, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	for _, sn := range all {
-		fmt.Fprintf(stdout, "%s\t%s\n", sn.ID, sn.Summary())
+		fmt.Fprintf(stdout, "%s\t%s\n", sn.ID, sanitize.Line(sn.Summary()))
 	}
 	return 0
 }
@@ -302,7 +308,9 @@ func cmdExport(storePath string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, string(data))
 		return 0
 	}
-	if err := os.WriteFile(*out, data, 0o644); err != nil {
+	// The export is a full copy of the store and may contain secrets, so it is
+	// written owner read/write only.
+	if err := os.WriteFile(*out, data, 0o600); err != nil {
 		fmt.Fprintln(stderr, "snippetbox:", err)
 		return 1
 	}
@@ -315,7 +323,7 @@ func cmdImport(storePath string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "snippetbox: import requires a file path")
 		return 2
 	}
-	data, err := os.ReadFile(args[0])
+	data, err := readImportFile(args[0])
 	if err != nil {
 		fmt.Fprintln(stderr, "snippetbox:", err)
 		return 1
@@ -338,8 +346,28 @@ func cmdImport(storePath string, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// readImportFile reads an import file, refusing files larger than maxImportBytes
+// to bound memory use from a hostile or accidentally huge file.
+func readImportFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// Read one byte past the cap so we can detect oversize files.
+	data, err := io.ReadAll(io.LimitReader(f, maxImportBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxImportBytes {
+		return nil, fmt.Errorf("import file exceeds %d MiB limit", maxImportBytes>>20)
+	}
+	return data, nil
+}
+
 // decodeSnippets accepts either a full store document {"version":..,"snippets":[]}
-// or a bare array of snippets.
+// or a bare array of snippets. Any other JSON shape (object, scalar, garbage) is
+// rejected so a malformed file cannot be silently treated as zero snippets.
 func decodeSnippets(data []byte) ([]snippet.Snippet, error) {
 	var doc struct {
 		Snippets []snippet.Snippet `json:"snippets"`
@@ -349,7 +377,7 @@ func decodeSnippets(data []byte) ([]snippet.Snippet, error) {
 	}
 	var arr []snippet.Snippet
 	if err := json.Unmarshal(data, &arr); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("expected a snippet array or store document: %w", err)
 	}
 	return arr, nil
 }

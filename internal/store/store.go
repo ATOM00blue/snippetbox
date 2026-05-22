@@ -106,8 +106,17 @@ func (s *Store) Get(id string) (snippet.Snippet, error) {
 }
 
 // Add inserts a new snippet and persists the store. If the snippet has no ID,
-// one is generated. Timestamps are set when zero.
+// one is generated. Timestamps are set when zero. The snippet is sanitized of
+// terminal control sequences and validated before being stored.
 func (s *Store) Add(sn snippet.Snippet) (snippet.Snippet, error) {
+	clean, err := sn.Clean()
+	if err != nil {
+		return snippet.Snippet{}, err
+	}
+	clean.ID = sn.ID
+	clean.CreatedAt = sn.CreatedAt
+	clean.UpdatedAt = sn.UpdatedAt
+	sn = clean
 	if sn.ID == "" {
 		sn.ID = snippet.NewID()
 	}
@@ -122,7 +131,6 @@ func (s *Store) Add(sn snippet.Snippet) (snippet.Snippet, error) {
 	if sn.UpdatedAt.IsZero() {
 		sn.UpdatedAt = now
 	}
-	sn.Tags = snippet.NormalizeTags(sn.Tags)
 	s.snippets = append(s.snippets, sn)
 	if err := s.Save(); err != nil {
 		return snippet.Snippet{}, err
@@ -130,14 +138,19 @@ func (s *Store) Add(sn snippet.Snippet) (snippet.Snippet, error) {
 	return sn, nil
 }
 
-// Update replaces the snippet matching sn.ID and persists the store.
+// Update replaces the snippet matching sn.ID and persists the store. The
+// snippet is sanitized and validated before being stored.
 func (s *Store) Update(sn snippet.Snippet) error {
 	for i := range s.snippets {
 		if s.snippets[i].ID == sn.ID {
-			sn.CreatedAt = s.snippets[i].CreatedAt
-			sn.UpdatedAt = time.Now().UTC()
-			sn.Tags = snippet.NormalizeTags(sn.Tags)
-			s.snippets[i] = sn
+			clean, err := sn.Clean()
+			if err != nil {
+				return err
+			}
+			clean.ID = sn.ID
+			clean.CreatedAt = s.snippets[i].CreatedAt
+			clean.UpdatedAt = time.Now().UTC()
+			s.snippets[i] = clean
 			return s.Save()
 		}
 	}
@@ -155,15 +168,27 @@ func (s *Store) Delete(id string) error {
 	return ErrNotFound
 }
 
-// Import merges snippets from others into the store. Snippets whose ID already
-// exists are skipped unless their ID is empty (then a new one is assigned).
-// Returns the number of snippets added.
+// Import merges snippets from others into the store. Each incoming snippet is
+// sanitized of terminal control sequences and validated; entries that fail
+// validation (empty title/content) are skipped rather than aborting the import.
+// Snippets whose ID already exists are skipped unless their ID is empty (then a
+// new one is assigned). Returns the number of snippets added.
 func (s *Store) Import(others []snippet.Snippet) (int, error) {
 	added := 0
 	for _, sn := range others {
 		if sn.ID != "" && s.idExists(sn.ID) {
 			continue
 		}
+		id := sn.ID
+		created, updated := sn.CreatedAt, sn.UpdatedAt
+		clean, err := sn.Clean()
+		if err != nil {
+			// Skip invalid imported snippets; do not poison the store.
+			continue
+		}
+		clean.ID = id
+		clean.CreatedAt, clean.UpdatedAt = created, updated
+		sn = clean
 		if sn.ID == "" {
 			sn.ID = snippet.NewID()
 		}
@@ -177,7 +202,6 @@ func (s *Store) Import(others []snippet.Snippet) (int, error) {
 		if sn.UpdatedAt.IsZero() {
 			sn.UpdatedAt = now
 		}
-		sn.Tags = snippet.NormalizeTags(sn.Tags)
 		s.snippets = append(s.snippets, sn)
 		added++
 	}
@@ -195,14 +219,21 @@ func (s *Store) Marshal() ([]byte, error) {
 	return json.MarshalIndent(doc, "", "  ")
 }
 
-// Save writes the store to disk atomically.
+// storeFileMode is the permission applied to the on-disk store. Snippets may
+// contain secrets, so the file is owner read/write only.
+const storeFileMode = 0o600
+
+// storeDirMode restricts the store directory to the owner.
+const storeDirMode = 0o700
+
+// Save writes the store to disk atomically with restrictive (0600) permissions.
 func (s *Store) Save() error {
 	data, err := s.Marshal()
 	if err != nil {
 		return fmt.Errorf("encode store: %w", err)
 	}
 	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, storeDirMode); err != nil {
 		return fmt.Errorf("create store dir: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".snippets-*.tmp")
@@ -213,12 +244,18 @@ func (s *Store) Save() error {
 	// Best-effort cleanup if anything below fails before the rename.
 	defer os.Remove(tmpName)
 
+	// Enforce 0600 explicitly rather than relying on os.CreateTemp's default,
+	// which is an implementation detail. (No-op on Windows.)
+	if err := tmp.Chmod(storeFileMode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temp file permissions: %w", err)
+	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("sync temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

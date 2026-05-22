@@ -3,10 +3,27 @@ package snippet
 
 import (
 	"crypto/rand"
+	"errors"
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/ATOM00blue/snippetbox/internal/sanitize"
 )
+
+// Field length caps. These bound memory use from untrusted imports and keep the
+// store and UI well-behaved. Content is generous (whole files are a valid use
+// case) but still bounded.
+const (
+	MaxTitleLen    = 512
+	MaxLanguageLen = 64
+	MaxTagLen      = 64
+	MaxTags        = 64
+	MaxContentLen  = 1 << 20 // 1 MiB per snippet
+)
+
+// ErrInvalid is returned when a snippet fails validation.
+var ErrInvalid = errors.New("invalid snippet")
 
 // Snippet is a single stored piece of code or text.
 type Snippet struct {
@@ -39,37 +56,89 @@ func NewID() string {
 	return string(b)
 }
 
-// New builds a Snippet with generated ID and timestamps. Tags are normalized.
+// New builds a Snippet with generated ID and timestamps. All user-supplied
+// fields are sanitized of terminal control sequences, normalized, and capped.
 func New(title, language, content string, tags []string) Snippet {
 	now := time.Now().UTC()
-	return Snippet{
+	s := Snippet{
 		ID:        NewID(),
-		Title:     strings.TrimSpace(title),
-		Tags:      NormalizeTags(tags),
-		Language:  strings.TrimSpace(language),
+		Title:     title,
+		Tags:      tags,
+		Language:  language,
 		Content:   content,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	return s.Sanitize()
 }
 
 // NormalizeTags trims, lowercases, de-duplicates and drops empty tags while
-// preserving first-seen order.
+// preserving first-seen order. Tags are sanitized of control characters and
+// length-capped, and the overall count is bounded.
 func NormalizeTags(tags []string) []string {
 	seen := make(map[string]struct{}, len(tags))
 	out := make([]string, 0, len(tags))
 	for _, t := range tags {
-		t = strings.ToLower(strings.TrimSpace(t))
+		t = strings.ToLower(strings.TrimSpace(sanitize.Line(t)))
 		if t == "" {
 			continue
+		}
+		if len(t) > MaxTagLen {
+			t = t[:MaxTagLen]
 		}
 		if _, ok := seen[t]; ok {
 			continue
 		}
 		seen[t] = struct{}{}
 		out = append(out, t)
+		if len(out) >= MaxTags {
+			break
+		}
 	}
 	return out
+}
+
+// truncate caps s to at most n bytes without splitting a UTF-8 rune.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	// back up to a rune boundary
+	for n > 0 && (s[n]&0xC0) == 0x80 {
+		n--
+	}
+	return s[:n]
+}
+
+// Sanitize returns a copy of s with untrusted fields cleaned of terminal
+// control sequences, normalized, and length-capped. It does not validate; use
+// Validate (or Clean) to also enforce required fields.
+func (s Snippet) Sanitize() Snippet {
+	s.Title = truncate(sanitize.Line(s.Title), MaxTitleLen)
+	s.Language = truncate(sanitize.Line(s.Language), MaxLanguageLen)
+	s.Tags = NormalizeTags(s.Tags)
+	s.Content = truncate(sanitize.Content(s.Content), MaxContentLen)
+	return s
+}
+
+// Validate reports whether s has the required fields after sanitization.
+func (s Snippet) Validate() error {
+	if strings.TrimSpace(s.Title) == "" {
+		return errors.Join(ErrInvalid, errors.New("title is required"))
+	}
+	if strings.TrimSpace(s.Content) == "" {
+		return errors.Join(ErrInvalid, errors.New("content is required"))
+	}
+	return nil
+}
+
+// Clean sanitizes s and returns it with an error if it fails validation.
+func (s Snippet) Clean() (Snippet, error) {
+	s = s.Sanitize()
+	if err := s.Validate(); err != nil {
+		return Snippet{}, err
+	}
+	return s, nil
 }
 
 // ParseTags splits a comma-separated tag string into normalized tags.

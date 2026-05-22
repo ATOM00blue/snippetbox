@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ATOM00blue/snippetbox/internal/sanitize"
 	"github.com/ATOM00blue/snippetbox/internal/search"
 	"github.com/ATOM00blue/snippetbox/internal/snippet"
 	"github.com/ATOM00blue/snippetbox/internal/store"
@@ -64,7 +65,9 @@ type item struct {
 	snip snippet.Snippet
 }
 
-func (i item) Title() string { return i.snip.Title }
+// Title is sanitized so a malicious snippet title cannot inject terminal
+// control sequences into the list.
+func (i item) Title() string { return sanitize.Line(i.snip.Title) }
 
 func (i item) Description() string {
 	parts := []string{}
@@ -75,9 +78,9 @@ func (i item) Description() string {
 		parts = append(parts, "#"+strings.Join(i.snip.Tags, " #"))
 	}
 	if len(parts) == 0 {
-		return firstLine(i.snip.Content)
+		return sanitize.Line(firstLine(i.snip.Content))
 	}
-	return strings.Join(parts, "  ")
+	return sanitize.Line(strings.Join(parts, "  "))
 }
 
 // FilterValue powers the list's built-in filtering. We include title, tags,
@@ -422,7 +425,9 @@ func (m *model) refreshPreview() {
 		m.preview.SetContent(metaStyle.Render("No snippet selected."))
 		return
 	}
-	m.preview.SetContent(highlight(sn.Content, sn.Language))
+	// Strip terminal control sequences from untrusted content before it is
+	// highlighted and rendered into the terminal.
+	m.preview.SetContent(highlight(sanitize.Content(sn.Content), sn.Language))
 	m.preview.GotoTop()
 }
 
@@ -463,13 +468,13 @@ func (m model) previewPane() string {
 	header := previewHeader.Render("Preview")
 	meta := ""
 	if sn, ok := m.currentSnippet(); ok {
-		header = previewHeader.Render(sn.Title)
-		bits := []string{"id " + sn.ID}
+		header = previewHeader.Render(sanitize.Line(sn.Title))
+		bits := []string{"id " + sanitize.Line(sn.ID)}
 		if sn.Language != "" {
-			bits = append(bits, "lang "+sn.Language)
+			bits = append(bits, "lang "+sanitize.Line(sn.Language))
 		}
 		if len(sn.Tags) > 0 {
-			bits = append(bits, "#"+strings.Join(sn.Tags, " #"))
+			bits = append(bits, "#"+sanitize.Line(strings.Join(sn.Tags, " #")))
 		}
 		meta = metaStyle.Render(strings.Join(bits, "  •  "))
 	}

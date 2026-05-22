@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -209,6 +210,142 @@ func TestExtractStoreFlagVariants(t *testing.T) {
 		if strings.Join(gotRest, ",") != strings.Join(c.rest, ",") {
 			t.Errorf("args %v: rest=%v want %v", c.args, gotRest, c.rest)
 		}
+	}
+}
+
+func TestShowSanitizesEscape(t *testing.T) {
+	sp := newStorePath(t)
+	// Add a snippet whose content carries terminal escape sequences via stdin so
+	// nothing rewrites it on the way in.
+	payload := "echo hi\x1b[2J\x1b]0;PWNED\x07done"
+	code, _, errb := runCLI(t, sp, payload, "add", "-t", "Evil", "--stdin")
+	if code != 0 {
+		t.Fatalf("add failed: %s", errb)
+	}
+	code, out, _ := runCLI(t, sp, "", "show", "Evil")
+	if code != 0 {
+		t.Fatalf("show failed code=%d", code)
+	}
+	if strings.ContainsRune(out, 0x1b) {
+		t.Fatalf("show emitted raw ESC byte: %q", out)
+	}
+	if strings.ContainsRune(out, 0x07) {
+		t.Fatalf("show emitted raw BEL byte: %q", out)
+	}
+	if !strings.Contains(out, "echo hi") || !strings.Contains(out, "done") {
+		t.Fatalf("show dropped visible content: %q", out)
+	}
+}
+
+func TestListSanitizesEscape(t *testing.T) {
+	sp := newStorePath(t)
+	runCLI(t, sp, "ls\x1b]0;PWN\x07", "add", "-t", "ti\x1b[2Jtle", "--stdin")
+	_, out, _ := runCLI(t, sp, "", "list")
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, 0x07) {
+		t.Fatalf("list emitted raw control bytes: %q", out)
+	}
+}
+
+func TestImportSanitizesContent(t *testing.T) {
+	sp := newStorePath(t)
+	bad := `[{"title":"X\u001b[2J","content":"echo\u001b]0;PWN\u0007 hi"}]`
+	f := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(f, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errb := runCLI(t, sp, "", "import", f)
+	if code != 0 {
+		t.Fatalf("import failed: %s", errb)
+	}
+	if !strings.Contains(out, "imported 1") {
+		t.Fatalf("unexpected import output: %q", out)
+	}
+	// Read the store file directly: no ESC/BEL must have been persisted.
+	data, err := os.ReadFile(sp)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if strings.ContainsRune(string(data), 0x1b) || strings.ContainsRune(string(data), 0x07) {
+		t.Fatalf("control byte persisted to store: %q", string(data))
+	}
+}
+
+func TestImportRejectsInvalidAndGarbage(t *testing.T) {
+	sp := newStorePath(t)
+
+	// Snippets missing title/content are skipped, not imported.
+	skip := `[{"title":"","content":"x"},{"title":"y","content":""}]`
+	f := filepath.Join(t.TempDir(), "skip.json")
+	if err := os.WriteFile(f, []byte(skip), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := runCLI(t, sp, "", "import", f)
+	if !strings.Contains(out, "imported 0") {
+		t.Fatalf("expected 0 imported for invalid snippets, got %q", out)
+	}
+
+	// Non-array, non-document JSON is rejected outright.
+	garbage := `{"unexpected":"object"}`
+	g := filepath.Join(t.TempDir(), "garbage.json")
+	if err := os.WriteFile(g, []byte(garbage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, errb := runCLI(t, sp, "", "import", g)
+	if code == 0 {
+		t.Fatalf("expected nonzero exit for garbage import, stderr=%q", errb)
+	}
+	if !strings.Contains(errb, "parse import file") {
+		t.Fatalf("unexpected error: %q", errb)
+	}
+}
+
+func TestImportRejectsOversize(t *testing.T) {
+	sp := newStorePath(t)
+	big := filepath.Join(t.TempDir(), "big.json")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write just over the 16 MiB limit.
+	if _, err := f.Write([]byte("[")); err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for i := range chunk {
+		chunk[i] = ' '
+	}
+	for i := 0; i < 17; i++ {
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.Close()
+
+	code, _, errb := runCLI(t, sp, "", "import", big)
+	if code == 0 {
+		t.Fatal("expected nonzero exit for oversize import")
+	}
+	if !strings.Contains(errb, "limit") {
+		t.Fatalf("expected size-limit error, got %q", errb)
+	}
+}
+
+func TestExportPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file mode bits are not meaningful on Windows")
+	}
+	sp := newStorePath(t)
+	runCLI(t, sp, "", "add", "-t", "S", "-c", "secret")
+	out := filepath.Join(t.TempDir(), "export.json")
+	if code, _, errb := runCLI(t, sp, "", "export", "-o", out); code != 0 {
+		t.Fatalf("export failed: %s", errb)
+	}
+	fi, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("stat export: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("export mode = %o, want 0600", got)
 	}
 }
 

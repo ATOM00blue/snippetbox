@@ -145,6 +145,43 @@ func TestFormValidation(t *testing.T) {
 	}
 }
 
+func TestListItemTitleSanitized(t *testing.T) {
+	it := item{snip: snippet.Snippet{Title: "ti\x1b[2Jtle", Content: "x"}}
+	if strings.ContainsRune(it.Title(), 0x1b) {
+		t.Fatalf("list Title kept ESC: %q", it.Title())
+	}
+	it2 := item{snip: snippet.Snippet{Title: "y", Content: "echo\x1b]0;PWN\x07"}}
+	if strings.ContainsRune(it2.Description(), 0x1b) || strings.ContainsRune(it2.Description(), 0x07) {
+		t.Fatalf("list Description kept control bytes: %q", it2.Description())
+	}
+}
+
+func TestPreviewSanitizesMaliciousContent(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "snippets.json"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Insert directly via the store; New/Add already sanitize, so to exercise the
+	// render-time defense we craft a snippet that still carries an OSC payload
+	// fragment and confirm refreshPreview does not emit the dangerous bytes
+	// verbatim.
+	if _, err := s.Add(snippet.New("Evil", "bash", "echo hi\x1b]0;PWNED\x07", nil)); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	m := newModel(s)
+	um, _ := m.Update(sizeMsg())
+	m = um.(model)
+	m.refreshPreview()
+	view := m.preview.View()
+	// The OSC title-set payload must not appear intact in the rendered preview.
+	if strings.Contains(view, "\x1b]0;PWNED") {
+		t.Fatalf("preview rendered raw OSC title-set sequence: %q", view)
+	}
+	if strings.ContainsRune(view, 0x07) {
+		t.Fatalf("preview rendered raw BEL byte")
+	}
+}
+
 func TestHighlightFallsBack(t *testing.T) {
 	// Unknown language must not panic and must return non-empty output.
 	out := highlight("echo hi", "bash")

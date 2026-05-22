@@ -73,6 +73,48 @@ func TestHaystackIncludesAllFields(t *testing.T) {
 	}
 }
 
+func TestNewSanitizesControlChars(t *testing.T) {
+	s := New("ti\x1b[2Jtle", "g\x1bo", "echo\x1b]0;PWN\x07 hi\nsecond", []string{"ta\x1bg"})
+	if strings.ContainsRune(s.Title, 0x1b) {
+		t.Fatalf("title kept ESC: %q", s.Title)
+	}
+	if strings.ContainsRune(s.Language, 0x1b) {
+		t.Fatalf("language kept ESC: %q", s.Language)
+	}
+	if strings.ContainsRune(s.Content, 0x1b) || strings.ContainsRune(s.Content, 0x07) {
+		t.Fatalf("content kept control bytes: %q", s.Content)
+	}
+	// Legitimate newline must survive in content.
+	if !strings.Contains(s.Content, "\n") {
+		t.Fatalf("content lost newline: %q", s.Content)
+	}
+	for _, tag := range s.Tags {
+		if strings.ContainsRune(tag, 0x1b) {
+			t.Fatalf("tag kept ESC: %q", tag)
+		}
+	}
+}
+
+func TestValidate(t *testing.T) {
+	if err := (Snippet{Title: "x", Content: "y"}).Validate(); err != nil {
+		t.Fatalf("valid snippet rejected: %v", err)
+	}
+	if err := (Snippet{Title: "", Content: "y"}).Validate(); err == nil {
+		t.Fatal("empty title accepted")
+	}
+	if err := (Snippet{Title: "x", Content: " "}).Validate(); err == nil {
+		t.Fatal("blank content accepted")
+	}
+}
+
+func TestSanitizeCapsLength(t *testing.T) {
+	long := strings.Repeat("a", MaxTitleLen+50)
+	s := Snippet{Title: long, Content: "x"}.Sanitize()
+	if len(s.Title) > MaxTitleLen {
+		t.Fatalf("title not capped: len=%d", len(s.Title))
+	}
+}
+
 func TestSummary(t *testing.T) {
 	s := New("My Title", "bash", "echo hi", []string{"shell"})
 	sum := s.Summary()

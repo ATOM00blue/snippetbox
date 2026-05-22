@@ -3,6 +3,8 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ATOM00blue/snippetbox/internal/snippet"
@@ -175,6 +177,87 @@ func TestAtomicWriteNoTempLeftBehind(t *testing.T) {
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".tmp" {
 			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestSavePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file mode bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "snippets.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Add(snippet.New("Secret", "", "export TOKEN=abc", nil)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat store: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("store file mode = %o, want 0600", got)
+	}
+	di, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat store dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Fatalf("store dir mode = %o, want 0700", got)
+	}
+}
+
+func TestAddSanitizesAndValidates(t *testing.T) {
+	s := tempStore(t)
+
+	// Escape-sequence-laden snippet must be stored sanitized.
+	saved, err := s.Add(snippet.New("ti\x1b[2Jtle", "go", "echo\x1b]0;PWN\x07 hi", nil))
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if strings.ContainsRune(saved.Title, 0x1b) || strings.ContainsRune(saved.Content, 0x1b) {
+		t.Fatalf("ESC survived into store: %+v", saved)
+	}
+
+	// Reopen and confirm nothing nasty was persisted to disk.
+	data, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if strings.ContainsRune(string(data), 0x1b) {
+		t.Fatalf("ESC byte persisted to store file")
+	}
+
+	// Empty title/content must be rejected.
+	if _, err := s.Add(snippet.Snippet{Title: "", Content: "x"}); err == nil {
+		t.Fatal("expected error for empty title")
+	}
+	if _, err := s.Add(snippet.Snippet{Title: "x", Content: "   "}); err == nil {
+		t.Fatal("expected error for empty content")
+	}
+}
+
+func TestImportSanitizesAndSkipsInvalid(t *testing.T) {
+	s := tempStore(t)
+	incoming := []snippet.Snippet{
+		{Title: "Good\x1b[31m", Content: "ls -la\x1b[2J"}, // sanitized, added
+		{Title: "", Content: "no title"},                  // invalid -> skipped
+		{Title: "no content", Content: "   "},             // invalid -> skipped
+	}
+	added, err := s.Import(incoming)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("expected 1 added (2 invalid skipped), got %d", added)
+	}
+	for _, sn := range s.All() {
+		if strings.ContainsRune(sn.Title, 0x1b) || strings.ContainsRune(sn.Content, 0x1b) {
+			t.Fatalf("ESC survived import: %+v", sn)
 		}
 	}
 }
